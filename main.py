@@ -28,7 +28,7 @@ dp = Dispatcher()
 ym_client = Client(YOOMONEY_TOKEN)
 
 # ================= БАЗА ДАННЫХ =================
-conn = sqlite3.connect('cyber_invest_final.db') 
+conn = sqlite3.connect('/app/data/cyber_invest_final.db') 
 cursor = conn.cursor()
 
 cursor.execute('''CREATE TABLE IF NOT EXISTS users
