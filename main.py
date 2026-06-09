@@ -14,17 +14,15 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-# Официальная библиотека ЮKassa
 from yookassa import Configuration, Payment
 
-# ================= НАСТРОЙКИ (ВВЕДИ СВОИ ДАННЫЕ) =================
+# ================= НАСТРОЙКИ =================
 BOT_TOKEN = "8727966393:AAENOC9N7CofxMct5WWuZDtpqyrl__Bwea4"
-ADMIN_ID = 5494544187  # Твой Telegram ID (для админки)
+ADMIN_ID = 5494544187  # Твой ID
 
-# Ключи из личного кабинета ЮKassa
-Configuration.account_id = "ТВОЙ_SHOP_ID"     # Например: 123456
-Configuration.secret_key = "ТВОЙ_SECRET_KEY"  # Секретный ключ API
-# =================================================================
+Configuration.account_id = "ТВОЙ_SHOP_ID"     
+Configuration.secret_key = "ТВОЙ_SECRET_KEY"  
+# =============================================
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -34,7 +32,7 @@ dp = Dispatcher()
 conn = sqlite3.connect('cyber_syndicate.db')
 cursor = conn.cursor()
 
-# Таблица игроков
+# База игроков (Добавлены стрики и время бонуса)
 cursor.execute('''CREATE TABLE IF NOT EXISTS users
                   (user_id INTEGER PRIMARY KEY, 
                    username TEXT, 
@@ -42,25 +40,27 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS users
                    diamonds INTEGER DEFAULT 0,      
                    botnet_lvl INTEGER DEFAULT 1,    
                    vip_until INTEGER DEFAULT 0,     
-                   last_login INTEGER)''')
+                   last_login INTEGER,
+                   daily_streak INTEGER DEFAULT 0,
+                   last_daily INTEGER DEFAULT 0)''')
 
-# Таблица для отслеживания платежей ЮKassa
 cursor.execute('''CREATE TABLE IF NOT EXISTS invoices
-                  (payment_id TEXT PRIMARY KEY,
-                   user_id INTEGER,
-                   pack_id TEXT)''')
+                  (payment_id TEXT PRIMARY KEY, user_id INTEGER, pack_id TEXT)''')
+
+# База промокодов
+cursor.execute('''CREATE TABLE IF NOT EXISTS promocodes
+                  (code TEXT PRIMARY KEY, reward_type TEXT, reward_amount INTEGER, activations_left INTEGER)''')
+# База использованных промокодов (чтобы 1 игрок не ввел дважды)
+cursor.execute('''CREATE TABLE IF NOT EXISTS used_promos
+                  (user_id INTEGER, code TEXT, UNIQUE(user_id, code))''')
 conn.commit()
 
-# ================= МАТЕМАТИКА ИГРЫ =================
-def get_upgrade_cost(level):
-    return int(100 * (1.15 ** (level - 1)))
-
-def get_income_per_hour(level):
-    return int(20 * level * (1.05 ** (level - 1)))
-
+# ================= МАТЕМАТИКА =================
+def get_upgrade_cost(level): return int(100 * (1.15 ** (level - 1)))
+def get_income_per_hour(level): return int(20 * level * (1.05 ** (level - 1)))
 MAX_OFFLINE_HOURS = 24  
+CASE_PRICE = 50 
 
-# ================= ПАКИ ДОНАТА =================
 SHOP_PACKS = {
     "pack_1": {"name": "💎 150 Алмазов", "price": 150.00, "diamonds": 150},
     "pack_2": {"name": "💎 1000 Алмазов (ХИТ)", "price": 890.00, "diamonds": 1000},
@@ -68,42 +68,57 @@ SHOP_PACKS = {
     "vip_1":  {"name": "👑 VIP Статус (30 дней)", "price": 1490.00, "diamonds": 0} 
 }
 
-CASE_PRICE = 50 
-
 class AdminStates(StatesGroup):
-    waiting_for_broadcast_text = State()
-    waiting_for_give_diamonds = State()
+    waiting_for_broadcast = State()
+    waiting_for_promo = State()
 
-# ================= ФУНКЦИИ =================
-def calculate_offline_income(user_id):
-    cursor.execute("SELECT last_login, botnet_lvl, vip_until FROM users WHERE user_id=?", (user_id,))
+# ================= КЛАВИАТУРЫ =================
+def get_main_keyboard():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="💻 Терминал"), KeyboardButton(text="🚀 Апгрейд Сети")],
+        [KeyboardButton(text="🎁 Ежедневный Бонус"), KeyboardButton(text="🎰 Рулетка")],
+        [KeyboardButton(text="🏆 Зал Славы"), KeyboardButton(text="💎 БАНК (Донат)")]
+    ], resize_keyboard=True)
+
+# ================= ОФФЛАЙН ДОХОД И СЛУЧАЙНЫЕ СОБЫТИЯ =================
+def calculate_offline_income_and_events(user_id):
+    cursor.execute("SELECT last_login, botnet_lvl, vip_until, crypto FROM users WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
-    if not row: return 0
+    if not row: return 0, ""
     
-    last_login, lvl, vip_until = row
+    last_login, lvl, vip_until, current_crypto = row
     current_time = int(time.time())
     
     hours_passed = min((current_time - last_login) / 3600.0, MAX_OFFLINE_HOURS)
-    multiplier = 2 if current_time < vip_until else 1 
+    if hours_passed < 0.1: return 0, "" # Слишком часто заходит
     
+    multiplier = 2 if current_time < vip_until else 1 
     income = int(hours_passed * get_income_per_hour(lvl) * multiplier)
     
+    event_msg = ""
+    # 20% шанс на случайное событие, если человека не было хотя бы 1 час
+    if hours_passed >= 1 and random.randint(1, 100) <= 20:
+        event_type = random.choice(["good_crypto", "good_gems", "bad_ddos"])
+        
+        if event_type == "good_crypto":
+            bonus = int(income * 0.5)
+            income += bonus
+            event_msg = f"\n\n🍀 <b>УДАЧА:</b> Вы нашли уязвимость в банке! Дополнительно добыто +{bonus:,} 💠!"
+        elif event_type == "good_gems":
+            cursor.execute("UPDATE users SET diamonds = diamonds + 15 WHERE user_id=?", (user_id,))
+            event_msg = f"\n\n🍀 <b>ДЖЕКПОТ:</b> В одной из взломанных баз лежал тайник. Вы получили +15 💎!"
+        elif event_type == "bad_ddos" and current_crypto > 0:
+            loss = int(current_crypto * 0.05) # Потеря 5% баланса
+            cursor.execute("UPDATE users SET crypto = crypto - ? WHERE user_id=?", (loss, user_id))
+            event_msg = f"\n\n⚠️ <b>ТРЕВОГА:</b> Конкуренты устроили DDoS-атаку! Вы потеряли {loss:,} 💠 баланса."
+
     if income > 0:
         cursor.execute("UPDATE users SET crypto = crypto + ?, last_login = ? WHERE user_id=?", 
                        (income, current_time, user_id))
         conn.commit()
-    return income
+    return income, event_msg
 
-def get_main_keyboard():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="💻 Терминал"), KeyboardButton(text="🚀 Апгрейд Сети")],
-        [KeyboardButton(text="🎰 Рулетка"), KeyboardButton(text="🏆 Зал Славы")],
-        [KeyboardButton(text="ℹ️ База Знаний"), KeyboardButton(text="💎 БАНК (Донат)")]
-    ], resize_keyboard=True)
-
-# ================= ХЭНДЛЕРЫ =================
-
-# --- АТМОСФЕРНОЕ ПРИВЕТСТВИЕ ---
+# ================= ХЭНДЛЕРЫ ИГРОКА =================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
@@ -112,47 +127,19 @@ async def cmd_start(message: Message):
     cursor.execute("INSERT OR IGNORE INTO users (user_id, username, last_login) VALUES (?, ?, ?)",
                    (user_id, username, int(time.time())))
     conn.commit()
+    await message.answer("🌐 <b>Добро пожаловать в Cyber Syndicate.</b>\nСтрой ботнет, майни крипту, стань номером один.", parse_mode="HTML", reply_markup=get_main_keyboard())
 
-    await message.answer("<i>[SYSTEM INITIALIZING...]</i>\n<i>[BYPASSING FIREWALLS... OK]</i>", parse_mode="HTML")
-    await asyncio.sleep(1)
-    
-    text = (
-        "🌐 <b>Подключение установлено. Добро пожаловать, Оператор.</b>\n\n"
-        "Вы попали в <b>Cyber Syndicate</b>. Здесь нет законов, есть только вычислительная мощность. "
-        "Вы начинаете свой путь в темном гараже с одним старым сервером.\n\n"
-        "Ваша цель — взламывать корпорации, майнить Крипту (💠) и расширять свой Ботнет.\n\n"
-        "👇 <b>Используйте Терминал ниже для управления сетью.</b>"
-    )
-    await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
-
-# --- БАЗА ЗНАНИЙ (ОБУЧЕНИЕ) ---
-@dp.message(F.text == "ℹ️ База Знаний")
-async def info_menu(message: Message):
-    text = (
-        "📖 <b>СЕКРЕТНЫЕ АРХИВЫ СИНДИКАТА</b>\n\n"
-        "💠 <b>Что такое Крипта?</b>\n"
-        "Основная валюта. За неё вы прокачиваете Ботнет. Чем выше уровень Ботнета, тем больше Крипты он приносит каждый час.\n\n"
-        "💎 <b>Что такое Алмазы?</b>\n"
-        "Премиум-ресурс. Их можно обменять на миллионы Крипты, либо тратить в Рулетке для мгновенной прокачки.\n\n"
-        "💤 <b>Нужно ли держать телефон включенным?</b>\n"
-        "Нет! Ботнет работает автономно <b>до 24 часов</b>. Просто заходите раз в сутки, чтобы собрать намайненное.\n\n"
-        "👑 <b>Что дает VIP-статус?</b>\n"
-        "VIP удваивает (x2) всю добычу вашей сети. Это самый быстрый путь на 1-е место в Топе!"
-    )
-    await message.answer(text, parse_mode="HTML")
-
-# --- 1. ПРОФИЛЬ ---
+# --- ПРОФИЛЬ И СОБЫТИЯ ---
 @dp.message(F.text == "💻 Терминал")
 async def show_profile(message: Message):
     user_id = message.from_user.id
-    income = calculate_offline_income(user_id)
+    income, event_msg = calculate_offline_income_and_events(user_id)
     
     cursor.execute("SELECT crypto, diamonds, botnet_lvl, vip_until FROM users WHERE user_id=?", (user_id,))
     crypto, diamonds, lvl, vip_until = cursor.fetchone()
     
     is_vip = int(time.time()) < vip_until
-    vip_status = "🟢 АКТИВЕН (Доход x2)" if is_vip else "🔴 НЕТ"
-    hourly_rate = get_income_per_hour(lvl) * (2 if is_vip else 1)
+    vip_status = "🟢 АКТИВЕН (x2)" if is_vip else "🔴 НЕТ"
 
     text = (
         f"👤 <b>Оператор:</b> @{message.from_user.username or 'Anon'}\n"
@@ -161,36 +148,108 @@ async def show_profile(message: Message):
         f"💎 Алмазы: <b>{diamonds:,}</b>\n"
         f"👑 VIP Статус: <b>{vip_status}</b>\n\n"
         f"🕸 Уровень Ботнета: <b>{lvl} LVL</b>\n"
-        f"📈 Скорость майнинга: <b>{hourly_rate:,} 💠/час</b>\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"📈 Майнинг: <b>{get_income_per_hour(lvl) * (2 if is_vip else 1):,} 💠/час</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
     )
-    if income > 0:
-        text += f"<i>✅ Пока вас не было, сервера добыли: +{income:,} 💠</i>"
+    if income > 0: text += f"\n<i>✅ Оффлайн добыча: +{income:,} 💠</i>"
+    if event_msg: text += event_msg
 
     await message.answer(text, parse_mode="HTML")
 
-# --- 2. АПГРЕЙД ---
+# --- ЕЖЕДНЕВНЫЙ БОНУС (RETENTION) ---
+@dp.message(F.text == "🎁 Ежедневный Бонус")
+async def daily_bonus(message: Message):
+    user_id = message.from_user.id
+    current_time = int(time.time())
+    
+    cursor.execute("SELECT last_daily, daily_streak, botnet_lvl FROM users WHERE user_id=?", (user_id,))
+    last_daily, streak, lvl = cursor.fetchone()
+    
+    hours_passed = (current_time - last_daily) / 3600.0
+    
+    if hours_passed < 24:
+        wait_hours = 24 - hours_passed
+        await message.answer(f"⏳ Вы уже забирали бонус! Следующий будет доступен через <b>{int(wait_hours)} ч.</b>", parse_mode="HTML")
+        return
+        
+    # Если прошло больше 48 часов, стрик сгорает
+    if hours_passed > 48:
+        streak = 1
+        msg_streak = "⚠️ Вы пропустили день! Ваш стрик сброшен до 1."
+    else:
+        streak += 1
+        msg_streak = f"🔥 Стрик поддерживается! День: {streak}."
+
+    # Награды в зависимости от дня
+    if streak % 7 == 0: # Каждый 7-й день - Супер приз (Алмазы)
+        reward_gems = 50
+        cursor.execute("UPDATE users SET diamonds = diamonds + ?, daily_streak = ?, last_daily = ? WHERE user_id=?", 
+                       (reward_gems, streak, current_time, user_id))
+        reward_text = f"💎 <b>МЕГА-БОНУС 7 ДНЯ:</b> +{reward_gems} Алмазов!"
+    else:
+        reward_crypto = get_income_per_hour(lvl) * 5 # Крипта, равная 5 часам дохода
+        cursor.execute("UPDATE users SET crypto = crypto + ?, daily_streak = ?, last_daily = ? WHERE user_id=?", 
+                       (reward_crypto, streak, current_time, user_id))
+        reward_text = f"💠 <b>Награда:</b> +{reward_crypto:,} Крипты!"
+
+    conn.commit()
+    await message.answer(f"🎁 <b>Ежедневная поставка</b>\n\n{msg_streak}\n{reward_text}\n\n<i>Заходите завтра, чтобы награда росла!</i>", parse_mode="HTML")
+
+# --- ВВОД ПРОМОКОДА ---
+@dp.message(Command("promo"))
+async def enter_promo(message: Message):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("⚠️ Использование: `/promo ВАШ_КОД`", parse_mode="Markdown")
+        return
+    
+    code = args[1].upper()
+    user_id = message.from_user.id
+    
+    # Проверка, не вводил ли юзер этот код
+    cursor.execute("SELECT * FROM used_promos WHERE user_id=? AND code=?", (user_id, code))
+    if cursor.fetchone():
+        await message.answer("❌ Вы уже активировали этот промокод!")
+        return
+        
+    cursor.execute("SELECT reward_type, reward_amount, activations_left FROM promocodes WHERE code=?", (code,))
+    promo = cursor.fetchone()
+    
+    if not promo:
+        await message.answer("❌ Неверный или несуществующий код.")
+        return
+        
+    r_type, r_amount, left = promo
+    if left <= 0:
+        await message.answer("❌ Количество активаций этого кода исчерпано.")
+        return
+        
+    # Выдача награды
+    if r_type == "diamonds":
+        cursor.execute("UPDATE users SET diamonds = diamonds + ? WHERE user_id=?", (r_amount, user_id))
+        msg = f"💎 Вы получили <b>{r_amount} Алмазов</b>!"
+    else:
+        cursor.execute("UPDATE users SET crypto = crypto + ? WHERE user_id=?", (r_amount, user_id))
+        msg = f"💠 Вы получили <b>{r_amount:,} Крипты</b>!"
+        
+    # Уменьшаем кол-во активаций и записываем юзера
+    cursor.execute("UPDATE promocodes SET activations_left = activations_left - 1 WHERE code=?", (code,))
+    cursor.execute("INSERT INTO used_promos (user_id, code) VALUES (?, ?)", (user_id, code))
+    conn.commit()
+    
+    await message.answer(f"✅ <b>Промокод активирован!</b>\n{msg}", parse_mode="HTML")
+
+# --- ОСТАЛЬНЫЕ МЕНЮ (КРАТКО) ---
 @dp.message(F.text == "🚀 Апгрейд Сети")
 async def upgrade_menu(message: Message):
     user_id = message.from_user.id
-    calculate_offline_income(user_id)
-    
-    cursor.execute("SELECT crypto, botnet_lvl FROM users WHERE user_id=?", (user_id,))
-    crypto, lvl = cursor.fetchone()
-    cost = get_upgrade_cost(lvl)
-    next_income = get_income_per_hour(lvl + 1)
-    
+    cursor.execute("SELECT botnet_lvl FROM users WHERE user_id=?", (user_id,))
+    lvl = cursor.fetchone()[0]
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🔼 Прокачать до {lvl + 1} LVL ({cost:,} 💠)", callback_data="upgrade_botnet")],
-        [InlineKeyboardButton(text=f"💎 Купить Крипту за Алмазы", callback_data="exchange_diamonds")]
+        [InlineKeyboardButton(text=f"🔼 Прокачать ({get_upgrade_cost(lvl):,} 💠)", callback_data="upgrade_botnet")],
+        [InlineKeyboardButton(text=f"💎 Купить Крипту", callback_data="exchange_diamonds")]
     ])
-    await message.answer(
-        f"🚀 <b>Расширение Сети</b>\n\n"
-        f"Текущий уровень: {lvl}\n"
-        f"Доход после апгрейда: {next_income:,} 💠/час\n\n"
-        f"<i>Уровень не имеет ограничений.</i>", 
-        parse_mode="HTML", reply_markup=kb
-    )
+    await message.answer(f"🚀 Текущий уровень: {lvl}", reply_markup=kb)
 
 @dp.callback_query(F.data == "upgrade_botnet")
 async def process_upgrade(callback: CallbackQuery):
@@ -198,265 +257,126 @@ async def process_upgrade(callback: CallbackQuery):
     cursor.execute("SELECT crypto, botnet_lvl FROM users WHERE user_id=?", (user_id,))
     crypto, lvl = cursor.fetchone()
     cost = get_upgrade_cost(lvl)
-    
-    if crypto < cost:
-        await callback.answer("❌ Не хватает Крипты! Зайдите позже или купите Алмазы.", show_alert=True)
-        return
-        
+    if crypto < cost: return await callback.answer("❌ Мало Крипты!", show_alert=True)
     cursor.execute("UPDATE users SET crypto = crypto - ?, botnet_lvl = botnet_lvl + 1 WHERE user_id=?", (cost, user_id))
     conn.commit()
-    await callback.message.edit_text(f"✅ <b>Успех!</b> Мощность ботнета увеличена до {lvl + 1} уровня!", parse_mode="HTML")
+    await callback.message.edit_text(f"✅ Ботнет улучшен до {lvl + 1} уровня!")
 
-@dp.callback_query(F.data == "exchange_diamonds")
-async def exchange_menu(callback: CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 10 Алмазов ➡️ 50,000 💠", callback_data="swap_10")]])
-    await callback.message.edit_text("🔄 <b>Теневой обменник</b>\nПозволяет мгновенно получить Крипту за Алмазы.", parse_mode="HTML", reply_markup=kb)
-
-@dp.callback_query(F.data == "swap_10")
-async def do_swap(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    cursor.execute("SELECT diamonds FROM users WHERE user_id=?", (user_id,))
-    if cursor.fetchone()[0] < 10:
-        await callback.answer("❌ Мало Алмазов! Перейдите в раздел БАНК.", show_alert=True)
-        return
-    cursor.execute("UPDATE users SET diamonds = diamonds - 10, crypto = crypto + 50000 WHERE user_id=?", (user_id,))
-    conn.commit()
-    await callback.message.edit_text("✅ Обмен совершен! На баланс добавлено +50,000 💠")
-
-# --- 3. РУЛЕТКА ---
 @dp.message(F.text == "🎰 Рулетка")
 async def roulette_menu(message: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"🎲 Взломать систему ({CASE_PRICE} 💎)", callback_data="spin_roulette")]])
-    await message.answer(f"🎰 <b>Даркнет-Рулетка</b>\nШанс выиграть VIP статус или мгновенно получить +5 уровней!\n<i>Цена взлома: {CASE_PRICE} 💎</i>", parse_mode="HTML", reply_markup=kb)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"🎲 Взломать ({CASE_PRICE} 💎)", callback_data="spin_roulette")]])
+    await message.answer(f"🎰 <b>Даркнет-Рулетка</b>\nШанс на VIP или +5 LVL!\n<i>Цена: {CASE_PRICE} 💎</i>", parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "spin_roulette")
 async def spin_roulette(callback: CallbackQuery):
     user_id = callback.from_user.id
     cursor.execute("SELECT diamonds, botnet_lvl FROM users WHERE user_id=?", (user_id,))
     diamonds, lvl = cursor.fetchone()
-    
-    if diamonds < CASE_PRICE:
-        await callback.answer("❌ Не хватает Алмазов!", show_alert=True)
-        return
-        
+    if diamonds < CASE_PRICE: return await callback.answer("❌ Мало Алмазов!", show_alert=True)
     cursor.execute("UPDATE users SET diamonds = diamonds - ? WHERE user_id=?", (CASE_PRICE, user_id))
     roll = random.randint(1, 100)
-    
     if roll <= 75:
         prize = get_upgrade_cost(lvl) * 2
         cursor.execute("UPDATE users SET crypto = crypto + ? WHERE user_id=?", (prize, user_id))
-        msg = f"💸 Системы безопасности обойдены: <b>+{prize:,} 💠</b>"
+        msg = f"💸 Выпало: <b>+{prize:,} 💠</b>"
     elif roll <= 95:
-        bonus_time = 3 * 24 * 3600
-        current_time = int(time.time())
-        cursor.execute("UPDATE users SET vip_until = MAX(vip_until, ?) + ? WHERE user_id=?", (current_time, bonus_time, user_id))
-        msg = f"👑 Выдан админ-доступ: <b>VIP на 3 дня</b>!"
+        cursor.execute("UPDATE users SET vip_until = MAX(vip_until, ?) + ? WHERE user_id=?", (int(time.time()), 3*24*3600, user_id))
+        msg = f"👑 Выпал <b>VIP на 3 дня</b>!"
     else:
         cursor.execute("UPDATE users SET botnet_lvl = botnet_lvl + 5 WHERE user_id=?", (user_id,))
-        msg = f"🎰 <b>ДЖЕКПОТ!!!</b> Критический взлом! Уровень ботнета: <b>+5 LVL</b>!!!"
-        
+        msg = f"🎰 <b>ДЖЕКПОТ!!! +5 LVL</b>"
     conn.commit()
-    await callback.message.edit_text(f"🎰 <i>Подбор пароля...</i>\n\n{msg}", parse_mode="HTML")
+    await callback.message.edit_text(f"🎰 Результат:\n\n{msg}", parse_mode="HTML")
 
-# --- 4. ТОП ИГРОКОВ ---
 @dp.message(F.text == "🏆 Зал Славы")
 async def leaderboard(message: Message):
     cursor.execute("SELECT username, botnet_lvl FROM users ORDER BY botnet_lvl DESC LIMIT 5")
     leaders = cursor.fetchall()
-    text = "🏆 <b>ВЫСШИЙ СИНДИКАТ</b> 🏆\n<i>Самые могущественные хакеры сети:</i>\n\n"
-    for i, leader in enumerate(leaders):
-        text += f"{i+1}. {leader[0]} — <b>{leader[1]} LVL</b>\n"
+    text = "🏆 <b>ВЫСШИЙ СИНДИКАТ</b> 🏆\n\n"
+    for i, l in enumerate(leaders): text += f"{i+1}. {l[0]} — <b>{l[1]} LVL</b>\n"
     await message.answer(text, parse_mode="HTML")
 
-
-# ================= ОФИЦИАЛЬНАЯ ЮKASSA (API) =================
-
+# ================= ЮKASSA =================
 @dp.message(F.text == "💎 БАНК (Донат)")
 async def donate_menu(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{SHOP_PACKS['pack_1']['name']} - {SHOP_PACKS['pack_1']['price']}₽", callback_data="buy_pack_1")],
-        [InlineKeyboardButton(text=f"{SHOP_PACKS['pack_2']['name']} - {SHOP_PACKS['pack_2']['price']}₽", callback_data="buy_pack_2")],
-        [InlineKeyboardButton(text=f"{SHOP_PACKS['pack_3']['name']} - {SHOP_PACKS['pack_3']['price']}₽", callback_data="buy_pack_3")],
-        [InlineKeyboardButton(text=f"{SHOP_PACKS['vip_1']['name']} - {SHOP_PACKS['vip_1']['price']}₽", callback_data="buy_vip_1")]
+        [InlineKeyboardButton(text=f"{p['name']} - {p['price']}₽", callback_data=f"buy_{k}")] for k, p in SHOP_PACKS.items()
     ])
-    await message.answer("💎 <b>Официальный Банк Синдиката</b>\nПриобретайте премиум-ресурсы для доминирования на серверах.", parse_mode="HTML", reply_markup=kb)
+    await message.answer("💎 <b>Официальный Банк</b>", parse_mode="HTML", reply_markup=kb)
 
-# Создание платежа в ЮKassa
 @dp.callback_query(F.data.startswith("buy_"))
 async def create_yookassa_payment(callback: CallbackQuery):
     pack_id = callback.data.replace("buy_", "")
     pack = SHOP_PACKS[pack_id]
-    user_id = callback.from_user.id
-    
-    # Отправляем сообщение о загрузке, так как запрос к API занимает время
-    loading_msg = await callback.message.edit_text("⏳ <i>Создаю защищенное соединение с банком...</i>", parse_mode="HTML")
-    
+    loading_msg = await callback.message.edit_text("⏳ <i>Подключение к банку...</i>", parse_mode="HTML")
     try:
-        idempotence_key = str(uuid.uuid4())
         payment = Payment.create({
-            "amount": {
-                "value": str(pack["price"]),
-                "currency": "RUB"
-            },
-            "confirmation": {
-                "type": "redirect",
-                "return_url": "https://t.me/" # Куда вернуть юзера после оплаты
-            },
-            "capture": True,
-            "description": f"Покупка {pack['name']} (ID {user_id})"
-        }, idempotence_key)
-        
-        pay_url = payment.confirmation.confirmation_url
-        payment_id = payment.id
-        
-        # Сохраняем payment_id в базу, чтобы потом проверить статус
-        cursor.execute("INSERT OR REPLACE INTO invoices (payment_id, user_id, pack_id) VALUES (?, ?, ?)", 
-                       (payment_id, user_id, pack_id))
+            "amount": {"value": str(pack["price"]), "currency": "RUB"},
+            "confirmation": {"type": "redirect", "return_url": "https://t.me/"},
+            "capture": True, "description": f"Покупка {pack['name']}"
+        }, str(uuid.uuid4()))
+        cursor.execute("INSERT OR REPLACE INTO invoices VALUES (?, ?, ?)", (payment.id, callback.from_user.id, pack_id))
         conn.commit()
-        
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"💳 Оплатить {pack['price']} ₽", url=pay_url)],
-            [InlineKeyboardButton(text="🔄 Я оплатил (Проверить)", callback_data=f"chk_{payment_id}")]
+            [InlineKeyboardButton(text=f"💳 Оплатить {pack['price']} ₽", url=payment.confirmation.confirmation_url)],
+            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"chk_{payment.id}")]
         ])
-        
-        await loading_msg.edit_text(
-            f"📦 Товар: <b>{pack['name']}</b>\n"
-            f"💰 К оплате: <b>{pack['price']} ₽</b>\n\n"
-            "Нажмите кнопку ниже для безопасной оплаты на сайте ЮKassa:", 
-            parse_mode="HTML", reply_markup=kb
-        )
-        
-    except Exception as e:
-        logging.error(f"Ошибка ЮKassa API: {e}")
-        await loading_msg.edit_text("❌ Ошибка соединения с кассой. Проверьте ShopID и SecretKey.")
+        await loading_msg.edit_text(f"📦 <b>{pack['name']}</b>\n💰 <b>{pack['price']} ₽</b>", parse_mode="HTML", reply_markup=kb)
+    except: await loading_msg.edit_text("❌ Ошибка соединения.")
 
-# Проверка статуса платежа
 @dp.callback_query(F.data.startswith("chk_"))
 async def check_payment(callback: CallbackQuery):
     payment_id = callback.data.replace("chk_", "")
-    
     try:
         payment = Payment.find_one(payment_id)
-        
         if payment.status == 'succeeded':
-            # Достаем инфу о заказе из БД
             cursor.execute("SELECT user_id, pack_id FROM invoices WHERE payment_id=?", (payment_id,))
             row = cursor.fetchone()
-            
-            if not row:
-                await callback.answer("Заказ уже был выдан ранее.", show_alert=True)
-                return
-                
-            user_id, pack_id = row
-            pack = SHOP_PACKS[pack_id]
-            
-            # Начисляем товар
-            if pack_id.startswith("vip"):
-                bonus_time = 30 * 24 * 3600
-                current_time = int(time.time())
-                cursor.execute("UPDATE users SET vip_until = MAX(vip_until, ?) + ? WHERE user_id=?", 
-                               (current_time, bonus_time, user_id))
-                msg = "👑 <b>Транзакция подтверждена! VIP на 30 дней успешно активирован!</b>"
+            if not row: return await callback.answer("Уже выдано.", show_alert=True)
+            u_id, p_id = row
+            if p_id.startswith("vip"):
+                cursor.execute("UPDATE users SET vip_until = MAX(vip_until, ?) + ? WHERE user_id=?", (int(time.time()), 30*24*3600, u_id))
+                msg = "👑 <b>VIP на 30 дней активирован!</b>"
             else:
-                gems = pack["diamonds"]
-                cursor.execute("UPDATE users SET diamonds = diamonds + ? WHERE user_id=?", (gems, user_id))
-                msg = f"💎 <b>Транзакция подтверждена!</b> Начислено {gems} Алмазов. Спасибо за поддержку!"
-
-            # Удаляем инвойс, чтобы не начислили дважды
+                cursor.execute("UPDATE users SET diamonds = diamonds + ? WHERE user_id=?", (SHOP_PACKS[p_id]["diamonds"], u_id))
+                msg = f"💎 <b>Начислено {SHOP_PACKS[p_id]['diamonds']} Алмазов!</b>"
             cursor.execute("DELETE FROM invoices WHERE payment_id=?", (payment_id,))
             conn.commit()
-            
             await callback.message.edit_text(msg, parse_mode="HTML")
-            await callback.answer()
-            
-        elif payment.status == 'canceled':
-             await callback.answer("❌ Платеж отменен банком.", show_alert=True)
-        else:
-             await callback.answer("⏳ Платеж еще в обработке. Если вы оплатили, подождите 30 секунд.", show_alert=True)
-             
-    except Exception as e:
-        logging.error(f"Ошибка проверки платежа: {e}")
-        await callback.answer("⚠️ Ошибка связи с ЮKassa.", show_alert=True)
+        elif payment.status == 'canceled': await callback.answer("❌ Отменено.", show_alert=True)
+        else: await callback.answer("⏳ В обработке. Ждите.", show_alert=True)
+    except: await callback.answer("⚠️ Ошибка.", show_alert=True)
 
-
-# ================= АДМИН-ПАНЕЛЬ =================
+# ================= АДМИНКА (Добавлено создание промокодов) =================
 @dp.message(Command("admin"))
 async def admin_panel(message: Message):
     if message.from_user.id != ADMIN_ID: return
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="💎 Выдать Алмазы", callback_data="admin_give_gems")]
+        [InlineKeyboardButton(text="🎟 Создать Промокод", callback_data="admin_promo")]
     ])
-    await message.answer("👑 <b>Панель Администратора</b>", parse_mode="HTML", reply_markup=kb)
+    await message.answer("👑 <b>Админка</b>", parse_mode="HTML", reply_markup=kb)
 
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: CallbackQuery):
+@dp.callback_query(F.data == "admin_promo")
+async def create_promo_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID: return
-    cursor.execute("SELECT COUNT(user_id), SUM(crypto), SUM(diamonds) FROM users")
-    users_count, total_crypto, total_diamonds = cursor.fetchone()
-    text = (
-        "📊 <b>Статистика Игры:</b>\n\n"
-        f"👥 Всего игроков: <b>{users_count}</b>\n"
-        f"💠 Крипты в экономике: <b>{total_crypto or 0:,}</b>\n"
-        f"💎 Алмазов на руках: <b>{total_diamonds or 0:,}</b>"
-    )
-    await callback.message.edit_text(text, parse_mode="HTML")
-    await callback.answer()
+    await callback.message.answer("Формат создания промокода:\n<code>КОД ТИП(diamonds/crypto) СУММА КОЛ-ВО_ИСПОЛЬЗОВАНИЙ</code>\n\nПример: <code>GIFT2024 diamonds 100 50</code>", parse_mode="HTML")
+    await state.set_state(AdminStates.waiting_for_promo)
 
-@dp.callback_query(F.data == "admin_broadcast")
-async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID: return
-    await callback.message.answer("Введите текст для рассылки всем игрокам:")
-    await state.set_state(AdminStates.waiting_for_broadcast_text)
-    await callback.answer()
-
-@dp.message(AdminStates.waiting_for_broadcast_text)
-async def admin_broadcast_send(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
-    text = message.text
-    cursor.execute("SELECT user_id FROM users")
-    users = cursor.fetchall()
-    success = 0
-    await message.answer("📢 Рассылка началась...")
-    for user in users:
-        try:
-            await bot.send_message(user[0], f"📢 <b>Новость от Создателя:</b>\n\n{text}", parse_mode="HTML")
-            success += 1
-            await asyncio.sleep(0.05) 
-        except:
-            pass 
-    await message.answer(f"✅ Рассылка завершена!\nУспешно доставлено: {success} игрокам.")
-    await state.clear()
-
-@dp.callback_query(F.data == "admin_give_gems")
-async def admin_give_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID: return
-    await callback.message.answer("Введите ID игрока и количество алмазов через пробел.\nПример: <code>123456789 500</code>", parse_mode="HTML")
-    await state.set_state(AdminStates.waiting_for_give_diamonds)
-    await callback.answer()
-
-@dp.message(AdminStates.waiting_for_give_diamonds)
-async def admin_give_finish(message: Message, state: FSMContext):
+@dp.message(AdminStates.waiting_for_promo)
+async def create_promo_finish(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
     try:
         parts = message.text.split()
-        target_id, amount = int(parts[0]), int(parts[1])
-        cursor.execute("UPDATE users SET diamonds = diamonds + ? WHERE user_id=?", (amount, target_id))
-        if cursor.rowcount == 0:
-            await message.answer("❌ Игрок не найден.")
-        else:
-            conn.commit()
-            await message.answer(f"✅ Выдано {amount} 💎.")
-            try: await bot.send_message(target_id, f"🎁 <b>Администратор выдал вам:</b> {amount} 💎!", parse_mode="HTML")
-            except: pass
-    except:
-        await message.answer("❌ Ошибка ввода. Формат: ID СУММА")
+        code, r_type, r_amount, acts = parts[0].upper(), parts[1], int(parts[2]), int(parts[3])
+        cursor.execute("INSERT INTO promocodes VALUES (?, ?, ?, ?)", (code, r_type, r_amount, acts))
+        conn.commit()
+        await message.answer(f"✅ Промокод <b>{code}</b> создан!\nЛюди должны ввести: <code>/promo {code}</code>", parse_mode="HTML")
+    except: await message.answer("❌ Ошибка формата.")
     await state.clear()
 
-# ================= ЗАПУСК =================
 async def main():
-    print("🚀 Cyber Syndicate (Premium YooKassa Edition) ЗАПУЩЕН!")
+    print("🚀 Cyber Syndicate (ULTIMATE) ЗАПУЩЕН!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
