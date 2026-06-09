@@ -2,381 +2,339 @@ import asyncio
 import logging
 import sqlite3
 import time
-import random
-import uuid
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery, 
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton
 )
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-
-from yookassa import Configuration, Payment
+from yoomoney import Client
 
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = "8727966393:AAENOC9N7CofxMct5WWuZDtpqyrl__Bwea4"
-ADMIN_ID = 5494544187  # Твой ID
+ADMIN_ID = 5494544187  # Твой Telegram ID
+ADMIN_USERNAME = "@vladofix28" # Твой юзернейм для вывода
 
-Configuration.account_id = "ТВОЙ_SHOP_ID"     
-Configuration.secret_key = "ТВОЙ_SECRET_KEY"  
+YOOMONEY_WALLET = "4100118935779591"  # Номер кошелька ЮMoney
+YOOMONEY_TOKEN = "5133D1719448E2A5E1083A0FC605E369944CBB992B1D4490F13E2D4636C03191"  # API Токен ЮMoney
 # =============================================
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+ym_client = Client(YOOMONEY_TOKEN)
 
 # ================= БАЗА ДАННЫХ =================
-conn = sqlite3.connect('cyber_syndicate.db')
+conn = sqlite3.connect('cyber_earn.db')
 cursor = conn.cursor()
 
-# База игроков (Добавлены стрики и время бонуса)
 cursor.execute('''CREATE TABLE IF NOT EXISTS users
                   (user_id INTEGER PRIMARY KEY, 
                    username TEXT, 
-                   crypto INTEGER DEFAULT 100,      
-                   diamonds INTEGER DEFAULT 0,      
-                   botnet_lvl INTEGER DEFAULT 1,    
-                   vip_until INTEGER DEFAULT 0,     
-                   last_login INTEGER,
-                   daily_streak INTEGER DEFAULT 0,
-                   last_daily INTEGER DEFAULT 0)''')
-
-cursor.execute('''CREATE TABLE IF NOT EXISTS invoices
-                  (payment_id TEXT PRIMARY KEY, user_id INTEGER, pack_id TEXT)''')
-
-# База промокодов
-cursor.execute('''CREATE TABLE IF NOT EXISTS promocodes
-                  (code TEXT PRIMARY KEY, reward_type TEXT, reward_amount INTEGER, activations_left INTEGER)''')
-# База использованных промокодов (чтобы 1 игрок не ввел дважды)
-cursor.execute('''CREATE TABLE IF NOT EXISTS used_promos
-                  (user_id INTEGER, code TEXT, UNIQUE(user_id, code))''')
+                   crypto INTEGER DEFAULT 0,        -- Валюта для апгрейдов
+                   rub_balance REAL DEFAULT 0,      -- Баланс для вывода
+                   trust_factor REAL DEFAULT 0,     -- Лимит на вывод (Кэш-поинты)
+                   servers INTEGER DEFAULT 1,       -- Доходность
+                   referrer_id INTEGER DEFAULT 0,   -- Кто пригласил
+                   last_login INTEGER)''')
 conn.commit()
 
-# ================= МАТЕМАТИКА =================
-def get_upgrade_cost(level): return int(100 * (1.15 ** (level - 1)))
-def get_income_per_hour(level): return int(20 * level * (1.05 ** (level - 1)))
-MAX_OFFLINE_HOURS = 24  
-CASE_PRICE = 50 
+# ================= ЭКОНОМИКА =================
+MIN_WITHDRAW = 1000 # Минималка на вывод
 
-SHOP_PACKS = {
-    "pack_1": {"name": "💎 150 Алмазов", "price": 150.00, "diamonds": 150},
-    "pack_2": {"name": "💎 1000 Алмазов (ХИТ)", "price": 890.00, "diamonds": 1000},
-    "pack_3": {"name": "💎 5000 Алмазов (МАГНАТ)", "price": 2990.00, "diamonds": 5000},
-    "vip_1":  {"name": "👑 VIP Статус (30 дней)", "price": 1490.00, "diamonds": 0} 
-}
-
-class AdminStates(StatesGroup):
-    waiting_for_broadcast = State()
-    waiting_for_promo = State()
+# Доходность: 1 Сервер приносит 100 Крипты в час. 
+# Курс: 10,000 Крипты = 1 Рубль
+SERVER_PRICE_RUB = 150 # Базовая цена сервера в рублях
+CRYPTO_RATE = 10000    # Курс обмена крипты на рубли
 
 # ================= КЛАВИАТУРЫ =================
 def get_main_keyboard():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="💻 Терминал"), KeyboardButton(text="🚀 Апгрейд Сети")],
-        [KeyboardButton(text="🎁 Ежедневный Бонус"), KeyboardButton(text="🎰 Рулетка")],
-        [KeyboardButton(text="🏆 Зал Славы"), KeyboardButton(text="💎 БАНК (Донат)")]
+        [KeyboardButton(text="💻 Профиль"), KeyboardButton(text="🚀 Купить Сервер")],
+        [KeyboardButton(text="🔄 Обменник"), KeyboardButton(text="👥 Рефералы")],
+        [KeyboardButton(text="💳 Пополнить"), KeyboardButton(text="💸 Вывод Средств")]
     ], resize_keyboard=True)
 
-# ================= ОФФЛАЙН ДОХОД И СЛУЧАЙНЫЕ СОБЫТИЯ =================
-def calculate_offline_income_and_events(user_id):
-    cursor.execute("SELECT last_login, botnet_lvl, vip_until, crypto FROM users WHERE user_id=?", (user_id,))
+# ================= ФУНКЦИИ =================
+def collect_income(user_id):
+    cursor.execute("SELECT last_login, servers FROM users WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
-    if not row: return 0, ""
-    
-    last_login, lvl, vip_until, current_crypto = row
+    if not row: return 0
+    last_login, servers = row
     current_time = int(time.time())
     
-    hours_passed = min((current_time - last_login) / 3600.0, MAX_OFFLINE_HOURS)
-    if hours_passed < 0.1: return 0, "" # Слишком часто заходит
+    hours_passed = min((current_time - last_login) / 3600.0, 24) # Максимум 24 часа оффлайн
+    income = int(hours_passed * (servers * 100)) # 100 крипты в час с 1 сервера
     
-    multiplier = 2 if current_time < vip_until else 1 
-    income = int(hours_passed * get_income_per_hour(lvl) * multiplier)
-    
-    event_msg = ""
-    # 20% шанс на случайное событие, если человека не было хотя бы 1 час
-    if hours_passed >= 1 and random.randint(1, 100) <= 20:
-        event_type = random.choice(["good_crypto", "good_gems", "bad_ddos"])
-        
-        if event_type == "good_crypto":
-            bonus = int(income * 0.5)
-            income += bonus
-            event_msg = f"\n\n🍀 <b>УДАЧА:</b> Вы нашли уязвимость в банке! Дополнительно добыто +{bonus:,} 💠!"
-        elif event_type == "good_gems":
-            cursor.execute("UPDATE users SET diamonds = diamonds + 15 WHERE user_id=?", (user_id,))
-            event_msg = f"\n\n🍀 <b>ДЖЕКПОТ:</b> В одной из взломанных баз лежал тайник. Вы получили +15 💎!"
-        elif event_type == "bad_ddos" and current_crypto > 0:
-            loss = int(current_crypto * 0.05) # Потеря 5% баланса
-            cursor.execute("UPDATE users SET crypto = crypto - ? WHERE user_id=?", (loss, user_id))
-            event_msg = f"\n\n⚠️ <b>ТРЕВОГА:</b> Конкуренты устроили DDoS-атаку! Вы потеряли {loss:,} 💠 баланса."
-
     if income > 0:
         cursor.execute("UPDATE users SET crypto = crypto + ?, last_login = ? WHERE user_id=?", 
                        (income, current_time, user_id))
         conn.commit()
-    return income, event_msg
+    return income
 
 # ================= ХЭНДЛЕРЫ ИГРОКА =================
-@dp.message(Command("start"))
+
+# --- СТАРТ И РЕФЕРАЛКА ---
+@dp.message(CommandStart())
 async def cmd_start(message: Message):
     user_id = message.from_user.id
-    username = message.from_user.username or f"Anon_{user_id}"
-
-    cursor.execute("INSERT OR IGNORE INTO users (user_id, username, last_login) VALUES (?, ?, ?)",
-                   (user_id, username, int(time.time())))
-    conn.commit()
-    await message.answer("🌐 <b>Добро пожаловать в Cyber Syndicate.</b>\nСтрой ботнет, майни крипту, стань номером один.", parse_mode="HTML", reply_markup=get_main_keyboard())
-
-# --- ПРОФИЛЬ И СОБЫТИЯ ---
-@dp.message(F.text == "💻 Терминал")
-async def show_profile(message: Message):
-    user_id = message.from_user.id
-    income, event_msg = calculate_offline_income_and_events(user_id)
+    username = message.from_user.username or f"User_{user_id}"
     
-    cursor.execute("SELECT crypto, diamonds, botnet_lvl, vip_until FROM users WHERE user_id=?", (user_id,))
-    crypto, diamonds, lvl, vip_until = cursor.fetchone()
-    
-    is_vip = int(time.time()) < vip_until
-    vip_status = "🟢 АКТИВЕН (x2)" if is_vip else "🔴 НЕТ"
+    # Обработка реферальной ссылки: /start 123456789
+    ref_id = 0
+    args = message.text.split()
+    if len(args) > 1 and args[1].isdigit():
+        ref_id = int(args[1])
+        if ref_id == user_id: ref_id = 0 # Нельзя быть своим рефералом
+
+    cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    if not cursor.fetchone():
+        cursor.execute("INSERT INTO users (user_id, username, last_login, referrer_id) VALUES (?, ?, ?, ?)",
+                       (user_id, username, int(time.time()), ref_id))
+        conn.commit()
+        
+        # Уведомляем пригласившего
+        if ref_id > 0:
+            try:
+                await bot.send_message(ref_id, "🎉 <b>По вашей ссылке зарегистрировался новый хакер!</b>\nВы будете получать 10% от его пополнений.", parse_mode="HTML")
+            except: pass
 
     text = (
-        f"👤 <b>Оператор:</b> @{message.from_user.username or 'Anon'}\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"💠 Крипта: <b>{crypto:,}</b>\n"
-        f"💎 Алмазы: <b>{diamonds:,}</b>\n"
-        f"👑 VIP Статус: <b>{vip_status}</b>\n\n"
-        f"🕸 Уровень Ботнета: <b>{lvl} LVL</b>\n"
-        f"📈 Майнинг: <b>{get_income_per_hour(lvl) * (2 if is_vip else 1):,} 💠/час</b>\n"
-        f"➖➖➖➖➖➖➖➖➖➖"
+        "🌐 <b>Добро пожаловать в Cyber Earn!</b>\n\n"
+        "Здесь ты можешь заработать реальные деньги. Покупай мощные сервера, майни крипту, "
+        "обменивай её на рубли и выводи на карту.\n\n"
+        "<i>Чем мощнее твой ботнет, тем больше реальных денег ты получаешь.</i>"
     )
-    if income > 0: text += f"\n<i>✅ Оффлайн добыча: +{income:,} 💠</i>"
-    if event_msg: text += event_msg
+    await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
+# --- ПРОФИЛЬ ---
+@dp.message(F.text == "💻 Профиль")
+async def show_profile(message: Message):
+    user_id = message.from_user.id
+    income = collect_income(user_id)
+    
+    cursor.execute("SELECT crypto, rub_balance, trust_factor, servers FROM users WHERE user_id=?", (user_id,))
+    crypto, rub, trust, servers = cursor.fetchone()
+    
+    rub_per_day = (servers * 100 * 24) / CRYPTO_RATE
+
+    text = (
+        f"👤 <b>Ваш профиль:</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"💰 Баланс: <b>{rub:.2f} ₽</b>\n"
+        f"💠 Крипта: <b>{crypto:,}</b>\n"
+        f"⚡️ Траст-Фактор (Лимит): <b>{trust:.2f} ₽</b>\n\n"
+        f"🖥 Серверов в сети: <b>{servers} шт.</b>\n"
+        f"📈 Доходность: <b>~{rub_per_day:.2f} ₽ / день</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"<i>💡 Подсказка: Траст-Фактор нужен для вывода. Приглашайте друзей, чтобы увеличить его!</i>"
+    )
+    if income > 0: text += f"\n\n<i>✅ Сервера намайнили: +{income:,} 💠</i>"
     await message.answer(text, parse_mode="HTML")
 
-# --- ЕЖЕДНЕВНЫЙ БОНУС (RETENTION) ---
-@dp.message(F.text == "🎁 Ежедневный Бонус")
-async def daily_bonus(message: Message):
+# --- ПОКУПКА СЕРВЕРОВ ---
+@dp.message(F.text == "🚀 Купить Сервер")
+async def shop_menu(message: Message):
     user_id = message.from_user.id
-    current_time = int(time.time())
+    collect_income(user_id)
+    cursor.execute("SELECT rub_balance, servers FROM users WHERE user_id=?", (user_id,))
+    rub, servers = cursor.fetchone()
     
-    cursor.execute("SELECT last_daily, daily_streak, botnet_lvl FROM users WHERE user_id=?", (user_id,))
-    last_daily, streak, lvl = cursor.fetchone()
+    cost = servers * SERVER_PRICE_RUB
     
-    hours_passed = (current_time - last_daily) / 3600.0
-    
-    if hours_passed < 24:
-        wait_hours = 24 - hours_passed
-        await message.answer(f"⏳ Вы уже забирали бонус! Следующий будет доступен через <b>{int(wait_hours)} ч.</b>", parse_mode="HTML")
-        return
-        
-    # Если прошло больше 48 часов, стрик сгорает
-    if hours_passed > 48:
-        streak = 1
-        msg_streak = "⚠️ Вы пропустили день! Ваш стрик сброшен до 1."
-    else:
-        streak += 1
-        msg_streak = f"🔥 Стрик поддерживается! День: {streak}."
-
-    # Награды в зависимости от дня
-    if streak % 7 == 0: # Каждый 7-й день - Супер приз (Алмазы)
-        reward_gems = 50
-        cursor.execute("UPDATE users SET diamonds = diamonds + ?, daily_streak = ?, last_daily = ? WHERE user_id=?", 
-                       (reward_gems, streak, current_time, user_id))
-        reward_text = f"💎 <b>МЕГА-БОНУС 7 ДНЯ:</b> +{reward_gems} Алмазов!"
-    else:
-        reward_crypto = get_income_per_hour(lvl) * 5 # Крипта, равная 5 часам дохода
-        cursor.execute("UPDATE users SET crypto = crypto + ?, daily_streak = ?, last_daily = ? WHERE user_id=?", 
-                       (reward_crypto, streak, current_time, user_id))
-        reward_text = f"💠 <b>Награда:</b> +{reward_crypto:,} Крипты!"
-
-    conn.commit()
-    await message.answer(f"🎁 <b>Ежедневная поставка</b>\n\n{msg_streak}\n{reward_text}\n\n<i>Заходите завтра, чтобы награда росла!</i>", parse_mode="HTML")
-
-# --- ВВОД ПРОМОКОДА ---
-@dp.message(Command("promo"))
-async def enter_promo(message: Message):
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("⚠️ Использование: `/promo ВАШ_КОД`", parse_mode="Markdown")
-        return
-    
-    code = args[1].upper()
-    user_id = message.from_user.id
-    
-    # Проверка, не вводил ли юзер этот код
-    cursor.execute("SELECT * FROM used_promos WHERE user_id=? AND code=?", (user_id, code))
-    if cursor.fetchone():
-        await message.answer("❌ Вы уже активировали этот промокод!")
-        return
-        
-    cursor.execute("SELECT reward_type, reward_amount, activations_left FROM promocodes WHERE code=?", (code,))
-    promo = cursor.fetchone()
-    
-    if not promo:
-        await message.answer("❌ Неверный или несуществующий код.")
-        return
-        
-    r_type, r_amount, left = promo
-    if left <= 0:
-        await message.answer("❌ Количество активаций этого кода исчерпано.")
-        return
-        
-    # Выдача награды
-    if r_type == "diamonds":
-        cursor.execute("UPDATE users SET diamonds = diamonds + ? WHERE user_id=?", (r_amount, user_id))
-        msg = f"💎 Вы получили <b>{r_amount} Алмазов</b>!"
-    else:
-        cursor.execute("UPDATE users SET crypto = crypto + ? WHERE user_id=?", (r_amount, user_id))
-        msg = f"💠 Вы получили <b>{r_amount:,} Крипты</b>!"
-        
-    # Уменьшаем кол-во активаций и записываем юзера
-    cursor.execute("UPDATE promocodes SET activations_left = activations_left - 1 WHERE code=?", (code,))
-    cursor.execute("INSERT INTO used_promos (user_id, code) VALUES (?, ?)", (user_id, code))
-    conn.commit()
-    
-    await message.answer(f"✅ <b>Промокод активирован!</b>\n{msg}", parse_mode="HTML")
-
-# --- ОСТАЛЬНЫЕ МЕНЮ (КРАТКО) ---
-@dp.message(F.text == "🚀 Апгрейд Сети")
-async def upgrade_menu(message: Message):
-    user_id = message.from_user.id
-    cursor.execute("SELECT botnet_lvl FROM users WHERE user_id=?", (user_id,))
-    lvl = cursor.fetchone()[0]
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🔼 Прокачать ({get_upgrade_cost(lvl):,} 💠)", callback_data="upgrade_botnet")],
-        [InlineKeyboardButton(text=f"💎 Купить Крипту", callback_data="exchange_diamonds")]
+        [InlineKeyboardButton(text=f"🖥 Купить за {cost} ₽", callback_data="buy_server")]
     ])
-    await message.answer(f"🚀 Текущий уровень: {lvl}", reply_markup=kb)
+    await message.answer(f"🚀 <b>Рынок Оборудования</b>\n\nТекущие сервера: {servers}\nКаждый новый сервер стоит дороже, но приносит стабильный доход в крипте.\n\n<b>Цена следующего: {cost} ₽</b>", parse_mode="HTML", reply_markup=kb)
 
-@dp.callback_query(F.data == "upgrade_botnet")
-async def process_upgrade(callback: CallbackQuery):
+@dp.callback_query(F.data == "buy_server")
+async def process_buy_server(callback: CallbackQuery):
     user_id = callback.from_user.id
-    cursor.execute("SELECT crypto, botnet_lvl FROM users WHERE user_id=?", (user_id,))
-    crypto, lvl = cursor.fetchone()
-    cost = get_upgrade_cost(lvl)
-    if crypto < cost: return await callback.answer("❌ Мало Крипты!", show_alert=True)
-    cursor.execute("UPDATE users SET crypto = crypto - ?, botnet_lvl = botnet_lvl + 1 WHERE user_id=?", (cost, user_id))
+    cursor.execute("SELECT rub_balance, servers FROM users WHERE user_id=?", (user_id,))
+    rub, servers = cursor.fetchone()
+    cost = servers * SERVER_PRICE_RUB
+    
+    if rub < cost:
+        await callback.answer("❌ Недостаточно рублей на балансе! Пополните счет.", show_alert=True)
+        return
+        
+    cursor.execute("UPDATE users SET rub_balance = rub_balance - ?, servers = servers + 1 WHERE user_id=?", (cost, user_id))
     conn.commit()
-    await callback.message.edit_text(f"✅ Ботнет улучшен до {lvl + 1} уровня!")
+    await callback.message.edit_text("✅ <b>Сервер успешно куплен!</b> Ваш пассивный доход вырос.", parse_mode="HTML")
 
-@dp.message(F.text == "🎰 Рулетка")
-async def roulette_menu(message: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"🎲 Взломать ({CASE_PRICE} 💎)", callback_data="spin_roulette")]])
-    await message.answer(f"🎰 <b>Даркнет-Рулетка</b>\nШанс на VIP или +5 LVL!\n<i>Цена: {CASE_PRICE} 💎</i>", parse_mode="HTML", reply_markup=kb)
+# --- ОБМЕННИК ---
+@dp.message(F.text == "🔄 Обменник")
+async def exchange_menu(message: Message):
+    user_id = message.from_user.id
+    collect_income(user_id)
+    cursor.execute("SELECT crypto FROM users WHERE user_id=?", (user_id,))
+    crypto = cursor.fetchone()[0]
+    
+    possible_rub = crypto / CRYPTO_RATE
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обменять всю Крипту", callback_data="exchange_all")]
+    ])
+    await message.answer(f"🔄 <b>Системный Обменник</b>\n\nКурс: {CRYPTO_RATE} 💠 = 1 ₽\n\nУ вас: <b>{crypto:,} 💠</b>\nВы получите: <b>{possible_rub:.2f} ₽</b>", parse_mode="HTML", reply_markup=kb)
 
-@dp.callback_query(F.data == "spin_roulette")
-async def spin_roulette(callback: CallbackQuery):
+@dp.callback_query(F.data == "exchange_all")
+async def process_exchange(callback: CallbackQuery):
     user_id = callback.from_user.id
-    cursor.execute("SELECT diamonds, botnet_lvl FROM users WHERE user_id=?", (user_id,))
-    diamonds, lvl = cursor.fetchone()
-    if diamonds < CASE_PRICE: return await callback.answer("❌ Мало Алмазов!", show_alert=True)
-    cursor.execute("UPDATE users SET diamonds = diamonds - ? WHERE user_id=?", (CASE_PRICE, user_id))
-    roll = random.randint(1, 100)
-    if roll <= 75:
-        prize = get_upgrade_cost(lvl) * 2
-        cursor.execute("UPDATE users SET crypto = crypto + ? WHERE user_id=?", (prize, user_id))
-        msg = f"💸 Выпало: <b>+{prize:,} 💠</b>"
-    elif roll <= 95:
-        cursor.execute("UPDATE users SET vip_until = MAX(vip_until, ?) + ? WHERE user_id=?", (int(time.time()), 3*24*3600, user_id))
-        msg = f"👑 Выпал <b>VIP на 3 дня</b>!"
-    else:
-        cursor.execute("UPDATE users SET botnet_lvl = botnet_lvl + 5 WHERE user_id=?", (user_id,))
-        msg = f"🎰 <b>ДЖЕКПОТ!!! +5 LVL</b>"
+    cursor.execute("SELECT crypto FROM users WHERE user_id=?", (user_id,))
+    crypto = cursor.fetchone()[0]
+    
+    if crypto < CRYPTO_RATE:
+        await callback.answer("❌ Минимальная сумма обмена: 10,000 Крипты.", show_alert=True)
+        return
+        
+    rub_to_add = crypto / CRYPTO_RATE
+    cursor.execute("UPDATE users SET rub_balance = rub_balance + ?, crypto = 0 WHERE user_id=?", (rub_to_add, user_id))
     conn.commit()
-    await callback.message.edit_text(f"🎰 Результат:\n\n{msg}", parse_mode="HTML")
+    await callback.message.edit_text(f"✅ Обмен успешен! Вы получили <b>{rub_to_add:.2f} ₽</b> на баланс.", parse_mode="HTML")
 
-@dp.message(F.text == "🏆 Зал Славы")
-async def leaderboard(message: Message):
-    cursor.execute("SELECT username, botnet_lvl FROM users ORDER BY botnet_lvl DESC LIMIT 5")
-    leaders = cursor.fetchall()
-    text = "🏆 <b>ВЫСШИЙ СИНДИКАТ</b> 🏆\n\n"
-    for i, l in enumerate(leaders): text += f"{i+1}. {l[0]} — <b>{l[1]} LVL</b>\n"
+# --- РЕФЕРАЛКА ---
+@dp.message(F.text == "👥 Рефералы")
+async def ref_menu(message: Message):
+    user_id = message.from_user.id
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+    
+    cursor.execute("SELECT COUNT(*) FROM users WHERE referrer_id=?", (user_id,))
+    refs_count = cursor.fetchone()[0]
+    
+    text = (
+        f"👥 <b>Партнерская программа</b>\n\n"
+        f"Вы получаете <b>10%</b> от суммы пополнения ваших рефералов на баланс и <b>+10% Траст-Фактора</b>!\n\n"
+        f"🔗 Ваша ссылка:\n<code>{ref_link}</code>\n\n"
+        f"Приглашено хакеров: <b>{refs_count}</b>"
+    )
     await message.answer(text, parse_mode="HTML")
 
-# ================= ЮKASSA =================
-@dp.message(F.text == "💎 БАНК (Донат)")
-async def donate_menu(message: Message):
+
+# ================= ПОПОЛНЕНИЕ (ЮМАНИ) =================
+@dp.message(F.text == "💳 Пополнить")
+async def deposit_menu(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{p['name']} - {p['price']}₽", callback_data=f"buy_{k}")] for k, p in SHOP_PACKS.items()
+        [InlineKeyboardButton(text="500 ₽", callback_data="dep_500"), InlineKeyboardButton(text="1000 ₽", callback_data="dep_1000")],
+        [InlineKeyboardButton(text="5000 ₽ (VIP-Множитель)", callback_data="dep_5000")]
     ])
-    await message.answer("💎 <b>Официальный Банк</b>", parse_mode="HTML", reply_markup=kb)
+    await message.answer("💳 <b>Пополнение баланса</b>\nПри пополнении вы получаете 30% Траст-Фактора от суммы.\nВыберите сумму:", parse_mode="HTML", reply_markup=kb)
 
-@dp.callback_query(F.data.startswith("buy_"))
-async def create_yookassa_payment(callback: CallbackQuery):
-    pack_id = callback.data.replace("buy_", "")
-    pack = SHOP_PACKS[pack_id]
-    loading_msg = await callback.message.edit_text("⏳ <i>Подключение к банку...</i>", parse_mode="HTML")
+@dp.callback_query(F.data.startswith("dep_"))
+async def create_deposit(callback: CallbackQuery):
+    amount = int(callback.data.replace("dep_", ""))
+    user_id = callback.from_user.id
+    label = f"dep_{amount}_{user_id}_{int(time.time())}"
+    
+    pay_url = (f"https://yoomoney.ru/quickpay/confirm.xml?"
+               f"receiver={YOOMONEY_WALLET}&quickpay-form=shop&targets=Пополнение баланса&paymentType=AC&sum={amount}&label={label}")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Оплатить {amount} ₽", url=pay_url)],
+        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"chkdep_{label}")]
+    ])
+    await callback.message.edit_text(f"Вы пополняете баланс на <b>{amount} ₽</b>.\nПерейдите по ссылке:", parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("chkdep_"))
+async def check_deposit(callback: CallbackQuery):
+    label = callback.data.replace("chkdep_", "")
+    parts = label.split("_")
+    amount = int(parts[0])
+    user_id = int(parts[1])
+    
     try:
-        payment = Payment.create({
-            "amount": {"value": str(pack["price"]), "currency": "RUB"},
-            "confirmation": {"type": "redirect", "return_url": "https://t.me/"},
-            "capture": True, "description": f"Покупка {pack['name']}"
-        }, str(uuid.uuid4()))
-        cursor.execute("INSERT OR REPLACE INTO invoices VALUES (?, ?, ?)", (payment.id, callback.from_user.id, pack_id))
-        conn.commit()
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"💳 Оплатить {pack['price']} ₽", url=payment.confirmation.confirmation_url)],
-            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"chk_{payment.id}")]
-        ])
-        await loading_msg.edit_text(f"📦 <b>{pack['name']}</b>\n💰 <b>{pack['price']} ₽</b>", parse_mode="HTML", reply_markup=kb)
-    except: await loading_msg.edit_text("❌ Ошибка соединения.")
+        history = ym_client.operation_history(label=label)
+        for operation in history.operations:
+            if operation.status == 'success':
+                # Защита: проверяем, не выдали ли уже (для простоты - меняем текст)
+                
+                # 1. Начисляем юзеру Баланс и 30% Траст-фактора
+                trust_gain = amount * 0.30
+                cursor.execute("UPDATE users SET rub_balance = rub_balance + ?, trust_factor = trust_factor + ? WHERE user_id=?", 
+                               (amount, trust_gain, user_id))
+                
+                # 2. Начисляем Рефереру (если есть) 10% Баланса и 10% Траст-фактора
+                cursor.execute("SELECT referrer_id FROM users WHERE user_id=?", (user_id,))
+                ref_id = cursor.fetchone()[0]
+                if ref_id > 0:
+                    ref_bonus = amount * 0.10
+                    cursor.execute("UPDATE users SET rub_balance = rub_balance + ?, trust_factor = trust_factor + ? WHERE user_id=?", 
+                                   (ref_bonus, ref_bonus, ref_id))
+                    try:
+                        await bot.send_message(ref_id, f"🎉 <b>Реферальный бонус!</b>\nВаш реферал пополнил счет. Вы получили <b>{ref_bonus} ₽</b> и Траст-Фактор!", parse_mode="HTML")
+                    except: pass
+                
+                conn.commit()
+                await callback.message.edit_text(f"✅ <b>Успешно!</b>\nНачислено {amount} ₽ и {trust_gain} Траст-Фактора.", parse_mode="HTML")
+                return
 
-@dp.callback_query(F.data.startswith("chk_"))
-async def check_payment(callback: CallbackQuery):
-    payment_id = callback.data.replace("chk_", "")
-    try:
-        payment = Payment.find_one(payment_id)
-        if payment.status == 'succeeded':
-            cursor.execute("SELECT user_id, pack_id FROM invoices WHERE payment_id=?", (payment_id,))
-            row = cursor.fetchone()
-            if not row: return await callback.answer("Уже выдано.", show_alert=True)
-            u_id, p_id = row
-            if p_id.startswith("vip"):
-                cursor.execute("UPDATE users SET vip_until = MAX(vip_until, ?) + ? WHERE user_id=?", (int(time.time()), 30*24*3600, u_id))
-                msg = "👑 <b>VIP на 30 дней активирован!</b>"
-            else:
-                cursor.execute("UPDATE users SET diamonds = diamonds + ? WHERE user_id=?", (SHOP_PACKS[p_id]["diamonds"], u_id))
-                msg = f"💎 <b>Начислено {SHOP_PACKS[p_id]['diamonds']} Алмазов!</b>"
-            cursor.execute("DELETE FROM invoices WHERE payment_id=?", (payment_id,))
-            conn.commit()
-            await callback.message.edit_text(msg, parse_mode="HTML")
-        elif payment.status == 'canceled': await callback.answer("❌ Отменено.", show_alert=True)
-        else: await callback.answer("⏳ В обработке. Ждите.", show_alert=True)
-    except: await callback.answer("⚠️ Ошибка.", show_alert=True)
+        await callback.answer("❌ Оплата еще не найдена. Ждите.", show_alert=True)
+    except:
+        await callback.answer("⚠️ Ошибка проверки ЮMoney.", show_alert=True)
 
-# ================= АДМИНКА (Добавлено создание промокодов) =================
+
+# ================= ВЫВОД СРЕДСТВ =================
+@dp.message(F.text == "💸 Вывод Средств")
+async def withdraw_request(message: Message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT rub_balance, trust_factor FROM users WHERE user_id=?", (user_id,))
+    rub, trust = cursor.fetchone()
+    
+    if rub < MIN_WITHDRAW:
+        await message.answer(f"❌ Минимальная сумма вывода: <b>{MIN_WITHDRAW} ₽</b>\nУ вас: {rub:.2f} ₽", parse_mode="HTML")
+        return
+        
+    if trust < MIN_WITHDRAW:
+        await message.answer(f"❌ Недостаточно <b>Траст-Фактора (Лимита)</b> для вывода {MIN_WITHDRAW} ₽.\n\nУ вас лимита: {trust:.2f} ⚡️\n\n<i>Приглашайте активных рефералов, чтобы повысить лимит вывода.</i>", parse_mode="HTML")
+        return
+        
+    # Формируем заявку
+    req_code = f"WD-{user_id}-{int(time.time())}"
+    
+    # Списываем баланс и траст
+    cursor.execute("UPDATE users SET rub_balance = rub_balance - ?, trust_factor = trust_factor - ? WHERE user_id=?", 
+                   (MIN_WITHDRAW, MIN_WITHDRAW, user_id))
+    conn.commit()
+    
+    text = (
+        f"✅ <b>Заявка на вывод {MIN_WITHDRAW} ₽ сформирована!</b>\n\n"
+        f"Код вашей заявки: <code>{req_code}</code>\n\n"
+        f"Сумма и лимит списаны с вашего аккаунта.\n\n"
+        f"⚠️ <b>ЧТОБЫ ПОЛУЧИТЬ ДЕНЬГИ:</b>\n"
+        f"Напишите администратору {ADMIN_USERNAME} в личные сообщения.\n"
+        f"Отправьте ему Код Заявки и номер вашей карты/кошелька."
+    )
+    await message.answer(text, parse_mode="HTML")
+    
+    # Уведомляем тебя как админа
+    await bot.send_message(ADMIN_ID, f"💰 <b>НОВАЯ ЗАЯВКА НА ВЫВОД!</b>\n\nЮзер: @{message.from_user.username}\nID: {user_id}\nСумма: {MIN_WITHDRAW} ₽\nКод: {req_code}", parse_mode="HTML")
+
+
+# ================= АДМИН ПАНЕЛЬ =================
 @dp.message(Command("admin"))
 async def admin_panel(message: Message):
     if message.from_user.id != ADMIN_ID: return
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="🎟 Создать Промокод", callback_data="admin_promo")]
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="💰 Выдать Рубли", callback_data="admin_give_rub")],
+        [InlineKeyboardButton(text="⚡️ Выдать Траст", callback_data="admin_give_trust")]
     ])
-    await message.answer("👑 <b>Админка</b>", parse_mode="HTML", reply_markup=kb)
+    await message.answer("👑 <b>Секретная Админка Проекта</b>", parse_mode="HTML", reply_markup=kb)
 
-@dp.callback_query(F.data == "admin_promo")
-async def create_promo_start(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
-    await callback.message.answer("Формат создания промокода:\n<code>КОД ТИП(diamonds/crypto) СУММА КОЛ-ВО_ИСПОЛЬЗОВАНИЙ</code>\n\nПример: <code>GIFT2024 diamonds 100 50</code>", parse_mode="HTML")
-    await state.set_state(AdminStates.waiting_for_promo)
+    cursor.execute("SELECT COUNT(*), SUM(rub_balance), SUM(trust_factor) FROM users")
+    users_count, total_rub, total_trust = cursor.fetchone()
+    text = f"📊 <b>Статистика:</b>\n👥 Игроков: {users_count}\n💰 Рублей на балансах: {total_rub or 0:.2f} ₽\n⚡️ Доступно к выводу игроками: {total_trust or 0:.2f} ₽ (Ваш максимальный риск)"
+    await callback.message.edit_text(text, parse_mode="HTML")
 
-@dp.message(AdminStates.waiting_for_promo)
-async def create_promo_finish(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
-    try:
-        parts = message.text.split()
-        code, r_type, r_amount, acts = parts[0].upper(), parts[1], int(parts[2]), int(parts[3])
-        cursor.execute("INSERT INTO promocodes VALUES (?, ?, ?, ?)", (code, r_type, r_amount, acts))
-        conn.commit()
-        await message.answer(f"✅ Промокод <b>{code}</b> создан!\nЛюди должны ввести: <code>/promo {code}</code>", parse_mode="HTML")
-    except: await message.answer("❌ Ошибка формата.")
-    await state.clear()
 
 async def main():
-    print("🚀 Cyber Syndicate (ULTIMATE) ЗАПУЩЕН!")
+    print("🚀 Cyber Earn (Play-To-Earn) ЗАПУЩЕН!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
